@@ -1,22 +1,24 @@
-"""PC Dual Audio — GUI ringan + sembunyi ke tray (stdlib tkinter; tray via pystray opsional)."""
+"""PC Dual Audio — 2 lagu beda jalan bareng (BT lagu A, internal lagu B)."""
 import json
 import os
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
-from audio_router import DualRouter, query_device_lists
+from dual_player import SlotPlayer, has_ffmpeg, list_outputs
 
 BG = "#121212"
-SURFACE = "#1E1E1E"
 CARD = "#242424"
 FG = "#FFFFFF"
 MUTED = "#B0B0B0"
 ACCENT = "#BB86FC"
 ACCENT2 = "#03DAC6"
 ERROR = "#CF6679"
+SURFACE = "#1E1E1E"
 
 CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+ICON_A = "🔊"
+ICON_B = "🎧"
 
 
 def load_config() -> dict:
@@ -36,26 +38,20 @@ def save_config(cfg: dict) -> None:
 
 
 def make_icon(running: bool):
-    """Ikon tray 64px via Pillow; None bila Pillow tak ada."""
     try:
         from PIL import Image, ImageDraw
     except ImportError:
         return None
-    color = ACCENT2 if running else "#888888"
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([4, 4, 60, 60], radius=14, fill=color)
+    d.rounded_rectangle([4, 4, 60, 60], radius=14, fill=ACCENT2 if running else "#888888")
     d.polygon([(26, 20), (26, 44), (46, 32)], fill="#000000")
     return img
 
 
-class TrayController:
-    """Ikon tray pystray di thread daemon. Tanpa pystray -> no-op (tombol Sembunyi pakai minimize biasa)."""
-
-    def __init__(self, app: "App"):
-        self.app = app
-        self.icon = None
-        self._thread = None
+class Tray:
+    def __init__(self, app):
+        self.app, self.icon = app, None
 
     @property
     def available(self) -> bool:
@@ -65,34 +61,22 @@ class TrayController:
         except ImportError:
             return False
 
-    def _menu(self):
-        import pystray
-        running = self.app.router is not None and self.app.router.running
-        return pystray.Menu(
-            pystray.MenuItem("Buka", lambda: self.app.after(0, self.app.show_window), default=True),
-            pystray.MenuItem("Stop" if running else "Mulai",
-                             lambda: self.app.after(0, self.app.toggle)),
-            pystray.MenuItem("Mode: Mirror" if self.app.mode.get() != "mirror" else "Mode: Split (L/R)",
-                             lambda: self.app.after(0, self.app.flip_mode)),
-            pystray.MenuItem("Keluar", lambda: self.app.after(0, self.app.quit_all)),
-        )
-
     def show(self):
         if not self.available or self.icon is not None:
             return
         import pystray
-        running = self.app.router is not None and self.app.router.running
-        self.icon = pystray.Icon("dual-audio", make_icon(running), "Dual Audio", menu=self._menu())
-        self._thread = threading.Thread(target=self.icon.run, daemon=True)
-        self._thread.start()
+        a, b = self.app.playing()
+        self.icon = pystray.Icon("dual", make_icon(a or b), "Dual Audio",
+                                menu=pystray.Menu(
+                                    pystray.MenuItem("Buka", lambda: self.app.after(0, self.app.show_window), default=True),
+                                    pystray.MenuItem("Keluar", lambda: self.app.after(0, self.app.quit_all))))
+        threading.Thread(target=self.icon.run, daemon=True).start()
 
     def refresh(self):
         if self.icon is not None:
             try:
-                running = self.app.router is not None and self.app.router.running
-                self.icon.icon = make_icon(running)
-                self.icon.menu = self._menu()
-                self.icon.update_menu()
+                a, b = self.app.playing()
+                self.icon.icon = make_icon(a or b)
             except Exception:  # noqa: BLE001 - tray best-effort
                 pass
 
@@ -101,198 +85,232 @@ class TrayController:
         if icon is not None:
             try:
                 icon.stop()
-            except Exception:  # noqa: BLE001 - best-effort
+            except Exception:  # noqa: BLE001
                 pass
+
+
+class SlotCard:
+    """Satu kartu = satu file + satu output + play/stop + volume."""
+
+    def __init__(self, parent, app, title, icon, cfg: dict):
+        self.app, self.icon = app, icon
+        self.player: SlotPlayer | None = None
+        fr = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        fr.pack(fill="x", pady=(0, 12))
+        self.fr = fr
+
+        ttk.Label(fr, text=f"{icon}  {title}", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        self.file_lbl = ttk.Label(fr, text="Belum ada file", style="Status.TLabel", wraplength=480)
+        self.file_lbl.pack(anchor="w", pady=(6, 0))
+
+        row = ttk.Frame(fr, style="Card.TFrame")
+        row.pack(fill="x", pady=(8, 0))
+        ttk.Label(row, text="File:").pack(side="left")
+        ttk.Button(row, text="📂 Pilih…", command=self.pick).pack(side="left", padx=(8, 0))
+
+        self.dev_var = tk.StringVar()
+        self.dev_idx: dict = {}
+        self.cb = ttk.Combobox(fr, textvariable=self.dev_var, state="readonly", width=58)
+        self.cb.pack(fill="x", pady=(8, 0))
+        self.cb.bind("<<ComboboxSelected>>", lambda _e: self._rebind())
+
+        self.g = tk.DoubleVar(value=cfg.get("g", 1.0))
+        self.loop = tk.BooleanVar(value=cfg.get("loop", False))
+        srow = ttk.Frame(fr, style="Card.TFrame")
+        srow.pack(fill="x", pady=(8, 0))
+        ttk.Label(srow, text="Volume").pack(side="left")
+        self.g_lbl = ttk.Label(srow, text=f"{int(self.g.get()*100)}%", width=6)
+        self.g_lbl.pack(side="right")
+        ttk.Checkbutton(srow, text="🔁 Ulangi", variable=self.loop).pack(side="right", padx=(0, 12))
+        ttk.Scale(fr, from_=0.0, to=1.5, variable=self.g,
+                  command=lambda _e: self._on_gain()).pack(fill="x")
+
+        brow = ttk.Frame(fr, style="Card.TFrame")
+        brow.pack(fill="x", pady=(10, 0))
+        self.btn = ttk.Button(brow, text="▶  PUTAR", command=self.toggle)
+        self.btn.pack(fill="x")
+        self.st = ttk.Label(fr, text="Siap.", style="Status.TLabel")
+        self.st.pack(anchor="w", pady=(4, 0))
+
+        self.refresh_devices()
+        if cfg.get("file") and os.path.exists(cfg["file"]):
+            self.load_file(cfg["file"], quiet=True)
+        if cfg.get("dev") in self.dev_idx.values():
+            for label, i in self.dev_idx.items():
+                if i == cfg["dev"]:
+                    self.dev_var.set(label)
+                    self._rebind()
+                    break
+
+    # -- device --
+    def refresh_devices(self):
+        outs = list_outputs()
+        keep = self.dev_var.get()
+        self.dev_idx = {label: i for i, label in outs}
+        self.cb["values"] = [label for _, label in outs]
+        if keep in self.dev_idx:
+            self.dev_var.set(keep)
+        elif outs:
+            self.dev_var.set(outs[0][1])
+        self._rebind(quiet=True)
+
+    def _on_gain(self):
+        self.g_lbl.config(text=f"{int(self.g.get()*100)}%")
+        if self.player:
+            self.player.gain = self.g.get()
+
+    def _rebind(self, quiet: bool = False):
+        if self.player and self.player.playing:
+            if not quiet:
+                messagebox.showinfo("Device", "Stop dulu sebelum ganti output.")
+            for label, i in self.dev_idx.items():
+                if self.player and i == self.player.device:
+                    self.dev_var.set(label)
+                    break
+            return
+        self.player = None
+
+    def _device(self) -> int:
+        try:
+            return self.dev_idx[self.dev_var.get()]
+        except KeyError:
+            raise RuntimeError("Pilih output device dulu.")
+
+    # -- file --
+    def pick(self):
+        path = filedialog.askopenfilename(
+            title=f"Pilih lagu {self.icon}",
+            filetypes=[("Audio", "*.mp3 *.wav *.m4a *.ogg *.flac"), ("Semua", "*.*")])
+        if path:
+            self.load_file(path)
+
+    def load_file(self, path: str, quiet: bool = False):
+        try:
+            p = SlotPlayer(self._device())
+        except RuntimeError as e:
+            if not quiet:
+                messagebox.showwarning("Device", str(e))
+            return
+        p.gain, p.loop = self.g.get(), self.loop.get()
+        p.on_error = lambda m: self.app.after(0, lambda: self.st.config(text=f"Error: {m}"))
+        try:
+            p.load(path)
+        except RuntimeError as e:
+            if not quiet:
+                messagebox.showerror("File", str(e))
+            else:
+                self.st.config(text=f"File lama gagal dibuka: {e}")
+            return
+        self.player = p
+        name = os.path.basename(path)
+        mins, secs = int(p.duration // 60), int(p.duration % 60)
+        self.file_lbl.config(text=f"🎵 {name}  ({mins}:{secs:02d})")
+        self.st.config(text="File siap. Tekan PUTAR.")
+        self.app.persist()
+
+    # -- transport --
+    def toggle(self):
+        if self.player and self.player.playing:
+            self.player.stop()
+            self.btn.config(text="▶  PUTAR", style="TButton")
+            self.st.config(text="Berhenti.")
+            self.app.tray.refresh()
+            return
+        if self.player is None or not self.player.file:
+            messagebox.showwarning("File", f"Pilih lagu {self.icon} dulu.")
+            return
+        try:
+            dev = self._device()
+        except RuntimeError as e:
+            messagebox.showwarning("Device", str(e))
+            return
+        if self.player.device != dev:
+            old = self.player
+            p = SlotPlayer(dev)
+            p.load(old.file)
+            p.on_error = old.on_error
+            self.player = p
+        self.player.gain, self.player.loop = self.g.get(), self.loop.get()
+        try:
+            self.player.play()
+        except RuntimeError as e:
+            messagebox.showerror("Putar", str(e))
+            return
+        self.btn.config(text="■  STOP", style="Stop.TButton")
+        other = "🎧" if self.icon == ICON_A else "🔊"
+        self.st.config(text=f"Jalan. {other} bisa muter lagu lain.")
+        self.app.tray.refresh()
+
+    def config(self) -> dict:
+        return {"file": self.player.file if self.player else "",
+                "dev": self.player.device if self.player else self.dev_idx.get(self.dev_var.get(), -1),
+                "g": self.g.get(), "loop": self.loop.get()}
+
+    def playing(self) -> bool:
+        return bool(self.player and self.player.playing)
+
+    def stop(self):
+        if self.player:
+            self.player.stop()
 
 
 class App(tk.Tk):
     def __init__(self, start_minimized: bool = False):
         super().__init__()
-        self.title("Dual Audio — Internal + Bluetooth")
-        self.geometry("560x640")
+        self.title("Dual Audio — 2 Lagu Beda Bersamaan")
+        self.geometry("580x760")
         self.configure(bg=BG)
-        self.router: DualRouter | None = None
-        self.tray = TrayController(self)
+        self.tray = Tray(self)
 
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("TFrame", background=BG)
-        style.configure("Card.TFrame", background=CARD)
-        style.configure("TLabel", background=CARD, foreground=FG, font=("Segoe UI", 10))
-        style.configure("Title.TLabel", background=BG, foreground=FG, font=("Segoe UI", 16, "bold"))
-        style.configure("Sub.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 10))
-        style.configure("Status.TLabel", background=CARD, foreground=MUTED, font=("Segoe UI", 9))
-        style.configure("TButton", background=ACCENT, foreground="#000000",
-                        font=("Segoe UI", 10, "bold"), padding=10, borderwidth=0)
+        for s, kw in [("TFrame", dict(background=BG)),
+                      ("Card.TFrame", dict(background=CARD)),
+                      ("TLabel", dict(background=CARD, foreground=FG, font=("Segoe UI", 10))),
+                      ("Title.TLabel", dict(background=BG, foreground=FG, font=("Segoe UI", 16, "bold"))),
+                      ("Sub.TLabel", dict(background=BG, foreground=MUTED, font=("Segoe UI", 10))),
+                      ("Status.TLabel", dict(background=CARD, foreground=MUTED, font=("Segoe UI", 9))),
+                      ("TButton", dict(background=ACCENT, foreground="#000000", font=("Segoe UI", 10, "bold"), padding=8, borderwidth=0)),
+                      ("Stop.TButton", dict(background=ERROR, foreground="#FFFFFF")),
+                      ("TCombobox", dict(fieldbackground=SURFACE, background=SURFACE, foreground=FG, arrowcolor=ACCENT)),
+                      ("Horizontal.TScale", dict(background=CARD, troughcolor=SURFACE)),
+                      ("TCheckbutton", dict(background=CARD, foreground=FG))]:
+            style.configure(s, **kw)
         style.map("TButton", background=[("active", ACCENT2), ("disabled", "#444444")])
-        style.configure("Stop.TButton", background=ERROR, foreground="#FFFFFF")
-        style.map("Stop.TButton", background=[("active", "#E57373")])
-        style.configure("TCombobox", fieldbackground=SURFACE, background=SURFACE,
-                        foreground=FG, arrowcolor=ACCENT)
-        style.configure("Horizontal.TScale", background=CARD, troughcolor=SURFACE)
-
-        header = ttk.Frame(self, style="TFrame")
-        header.pack(fill="x", padx=20, pady=(20, 4))
-        ttk.Label(header, text="Dual Audio", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(header, text="Bareng ke internal + Bluetooth, atau split kiri/kanan.",
-                  style="Sub.TLabel").pack(anchor="w")
-
-        self.card = ttk.Frame(self, style="Card.TFrame", padding=16)
-        self.card.pack(fill="both", expand=True, padx=20, pady=12)
 
         cfg = load_config()
-        self.mode = tk.StringVar(value=cfg.get("mode", "mirror"))
-        mode_row = ttk.Frame(self.card, style="Card.TFrame")
-        mode_row.pack(fill="x", pady=(0, 12))
-        ttk.Label(mode_row, text="Mode").pack(side="left")
-        ttk.Radiobutton(mode_row, text="Mirror (sama)", value="mirror", variable=self.mode,
-                        command=self._on_mode).pack(side="left", padx=(16, 8))
-        ttk.Radiobutton(mode_row, text="Split (L/R)", value="split", variable=self.mode,
-                        command=self._on_mode).pack(side="left")
+        hdr = ttk.Frame(self, style="TFrame")
+        hdr.pack(fill="x", padx=20, pady=(20, 4))
+        ttk.Label(hdr, text="Dual Audio", style="Title.TLabel").pack(anchor="w")
+        sub = "ffmpeg ✓ MP3 bisa" if has_ffmpeg() else "ffmpeg ✗ — cuma WAV (pasang ffmpeg biar MP3)"
+        ttk.Label(hdr, text=f"Pilih 2 lagu + 2 output. Jalan bareng. {sub}", style="Sub.TLabel").pack(anchor="w")
 
-        self.in_var, self.out1_var, self.out2_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
-        self.in_idx, self.out1_idx, self.out2_idx = {}, {}, {}
-        self.cb_in = self._combo("Sumber (input / Stereo Mix)", self.in_var)
-        self.cb_out1 = self._combo("Output 1 — Internal", self.out1_var)
-        self.cb_out2 = self._combo("Output 2 — Bluetooth", self.out2_var)
+        body = ttk.Frame(self, style="TFrame", padding=0)
+        body.pack(fill="both", expand=True, padx=20, pady=12)
+        self.slot_a = SlotCard(body, self, "Slot A — Internal", ICON_A, cfg.get("a", {}))
+        self.slot_b = SlotCard(body, self, "Slot B — Bluetooth", ICON_B, cfg.get("b", {}))
 
-        btn_row = ttk.Frame(self.card, style="Card.TFrame")
-        btn_row.pack(fill="x", pady=(4, 8))
-        ttk.Button(btn_row, text="↻ Refresh device", command=self.refresh_devices).pack(side="left")
-        ttk.Button(btn_row, text="⬇ Sembunyi ke tray", command=self.hide_to_tray).pack(side="right")
+        row = ttk.Frame(self, style="TFrame")
+        row.pack(fill="x", padx=20, pady=(0, 16))
+        ttk.Button(row, text="⬇ Sembunyi ke tray", command=self.hide_to_tray).pack(fill="x")
 
-        self.g1 = tk.DoubleVar(value=cfg.get("g1", 1.0))
-        self.g2 = tk.DoubleVar(value=cfg.get("g2", 1.0))
-        self._slider("Volume Internal", self.g1)
-        self._slider("Volume Bluetooth", self.g2)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        if start_minimized:
+            self.after(300, lambda: self.hide_to_tray(silent=True))
 
-        self.btn = ttk.Button(self.card, text="▶  MULAI", command=self.toggle)
-        self.btn.pack(fill="x", pady=(16, 4))
-        self.status = ttk.Label(self.card, text="Siap. Pilih device lalu MULAI.",
-                                style="Status.TLabel", wraplength=480)
-        self.status.pack(fill="x", pady=(4, 0))
+    # -- app-level --
+    def playing(self):
+        return self.slot_a.playing(), self.slot_b.playing()
 
-        self.refresh_devices(restore=cfg)
-        if start_minimized or cfg.get("minimized"):
-            self._autostart(cfg)
+    def persist(self):
+        save_config({"a": self.slot_a.config(), "b": self.slot_b.config()})
 
-    # ---- widgets ----
-    def _combo(self, label, var):
-        ttk.Label(self.card, text=label).pack(anchor="w", pady=(8, 2))
-        cb = ttk.Combobox(self.card, textvariable=var, state="readonly", width=60)
-        cb.pack(fill="x")
-        return cb
-
-    def _slider(self, label, var):
-        row = ttk.Frame(self.card, style="Card.TFrame")
-        row.pack(fill="x", pady=(8, 0))
-        ttk.Label(row, text=label).pack(side="left")
-        val = ttk.Label(row, text="100%", width=6)
-        val.pack(side="right")
-
-        def upd(_e=None):
-            val.config(text=f"{int(var.get() * 100)}%")
-            if self.router:
-                self.router.set_gains(self.g1.get(), self.g2.get())
-
-        ttk.Scale(self.card, from_=0.0, to=1.5, variable=var,
-                  command=lambda _e: upd()).pack(fill="x")
-        upd()
-
-    # ---- logic ----
-    def refresh_devices(self, restore: dict | None = None):
-        inputs, outputs = query_device_lists()
-        if not inputs and not outputs:
-            self.set_status("sounddevice belum terpasang / tak ada device. pip install -r pc/requirements.txt")
-            return
-        self.in_idx = {label: i for i, label in inputs}
-        self.out1_idx = {label: i for i, label in outputs}
-        self.out2_idx = dict(self.out1_idx)
-        self.cb_in["values"] = [label for _, label in inputs]
-        self.cb_out1["values"] = [label for _, label in outputs]
-        self.cb_out2["values"] = [label for _, label in outputs]
-        restore = restore or {}
-        self.in_var.set(restore.get("in_label", inputs[0][1]) if restore.get("in_label") in self.in_idx else inputs[0][1])
-        self.out1_var.set(restore.get("o1_label", outputs[0][1]) if restore.get("o1_label") in self.out1_idx else outputs[0][1])
-        last = outputs[-1][1] if len(outputs) > 1 else outputs[0][1]
-        self.out2_var.set(restore.get("o2_label", last) if restore.get("o2_label") in self.out2_idx else last)
-        self.set_status(f"{len(inputs)} input, {len(outputs)} output ketemu.")
-
-    def set_status(self, msg):
-        self.status.config(text=msg)
-
-    def _persist(self):
-        save_config({"in_label": self.in_var.get(), "o1_label": self.out1_var.get(),
-                     "o2_label": self.out2_var.get(), "mode": self.mode.get(),
-                     "g1": self.g1.get(), "g2": self.g2.get(), "minimized": True})
-
-    def _on_mode(self):
-        if self.router:
-            self.router.set_mode(self.mode.get())
-        self.tray.refresh()
-
-    def flip_mode(self):
-        self.mode.set("split" if self.mode.get() == "mirror" else "mirror")
-        self._on_mode()
-        self.set_status(f"Mode: {self.mode.get()}.")
-
-    def _autostart(self, cfg: dict):
-        """Jalan otomatis pakai config terakhir, langsung sembunyi ke tray."""
-        self.refresh_devices(restore=cfg)
-        try:
-            dev_in = self.in_idx[self.in_var.get()]
-            dev_o1 = self.out1_idx[self.out1_var.get()]
-            dev_o2 = self.out2_idx[self.out2_var.get()]
-        except KeyError:
-            return
-        if dev_o1 == dev_o2:
-            return
-        self._start_router(dev_in, dev_o1, dev_o2)
-        self.hide_to_tray(silent=True)
-
-    def _start_router(self, dev_in, dev_o1, dev_o2) -> bool:
-        r = DualRouter(dev_in, dev_o1, dev_o2, mode=self.mode.get())
-        r.set_gains(self.g1.get(), self.g2.get())
-        r.on_status = lambda m: self.after(0, lambda: self.set_status(m))
-        try:
-            r.start()
-        except Exception as e:  # noqa: BLE001 - tampilkan ke user
-            messagebox.showerror("Gagal start", str(e))
-            return False
-        self.router = r
-        self.btn.config(text="■  STOP", style="Stop.TButton")
-        m = "bersamaan (mirror)" if self.mode.get() == "mirror" else "split L→Internal, R→BT"
-        self.set_status(f"Jalan: {m}. Tutup jendela = sembunyi ke tray.")
-        self._persist()
-        self.tray.refresh()
-        return True
-
-    def toggle(self):
-        if self.router and self.router.running:
-            self.router.stop()
-            self.router = None
-            self.btn.config(text="▶  MULAI", style="TButton")
-            self.set_status("Berhenti.")
-            self.tray.refresh()
-            return
-        try:
-            dev_in = self.in_idx[self.in_var.get()]
-            dev_o1 = self.out1_idx[self.out1_var.get()]
-            dev_o2 = self.out2_idx[self.out2_var.get()]
-        except KeyError:
-            messagebox.showwarning("Device", "Pilih semua device dulu.")
-            return
-        if dev_o1 == dev_o2:
-            messagebox.showwarning("Device", "Output 1 dan 2 harus beda.")
-            return
-        self._start_router(dev_in, dev_o1, dev_o2)
-
-    # ---- tray ----
     def hide_to_tray(self, silent: bool = False):
+        self.persist()
         if not self.tray.available:
-            self.iconify()  # fallback: minimize biasa bila pystray tak ada
+            self.iconify()
             if not silent:
-                self.set_status("pystray belum dipasang — jendela di-minimize biasa. pip install pystray")
+                messagebox.showinfo("Tray", "pystray belum ada — minimize biasa.\npip install pystray")
             return
         self.withdraw()
         self.tray.show()
@@ -305,13 +323,14 @@ class App(tk.Tk):
 
     def quit_all(self):
         self.tray.hide()
-        if self.router:
-            self.router.stop()
+        self.slot_a.stop()
+        self.slot_b.stop()
         self.destroy()
 
     def on_close(self):
-        if self.router and self.router.running:
-            self.hide_to_tray()  # tutup jendela = jalan terus di tray
+        self.persist()
+        if self.playing()[0] or self.playing()[1]:
+            self.hide_to_tray()
         else:
             self.quit_all()
 
@@ -319,5 +338,4 @@ class App(tk.Tk):
 if __name__ == "__main__":
     import sys
     app = App(start_minimized="--tray" in sys.argv)
-    app.protocol("WM_DELETE_WINDOW", app.on_close)
     app.mainloop()

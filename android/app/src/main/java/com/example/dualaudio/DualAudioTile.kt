@@ -10,19 +10,21 @@ import androidx.annotation.RequiresApi
 @RequiresApi(Build.VERSION_CODES.N)
 class DualAudioTile : TileService() {
 
+    private fun jalan() = DualAudioService.runningA || DualAudioService.runningB
+
     override fun onStartListening() {
         super.onStartListening()
-        qsTile?.state = if (DualAudioService.running) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+        qsTile?.state = if (jalan()) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
         qsTile?.updateTile()
     }
 
     override fun onClick() {
         super.onClick()
-        if (DualAudioService.running) {
+        if (jalan()) {
             startService(Intent(this, DualAudioService::class.java).setAction(DualAudioService.ACTION_STOP))
             qsTile?.state = Tile.STATE_INACTIVE
         } else {
-            val i = Intent(this, DualAudioService::class.java).putExtra(DualAudioService.EXTRA_MODE, "mirror")
+            val i = Intent(this, DualAudioService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i)
             else startService(i)
             qsTile?.state = Tile.STATE_ACTIVE

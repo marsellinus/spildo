@@ -3,3 +3,12 @@ __pycache__/
 pc/config.json
 .venv/
 *.apk
+dist/
+build/
+build-tools/
+android/.gradle/
+android/app/build/
+android/gradle/
+*.spec
+*.log
+*.zip
