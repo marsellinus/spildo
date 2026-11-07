@@ -1,33 +1,33 @@
-# Dual Audio: Internal + Bluetooth
+# Dual Audio: 2 lagu beda jalan bareng
 
-2 aplikasi terpisah. Ringan, jalan background.
+Slot A → speaker internal, Slot B → Bluetooth. Lagu beda, jalan bersamaan.
 
-## PC (`pc/`)
+## PC — `DualAudio-v2.exe` (di Releases)
 
+Jalankan EXE. Tanpa install. Butuh `ffmpeg` di PATH biar MP3 bisa (tanpa itu cuma WAV).
+
+- Kartu A: pilih lagu + output internal → PUTAR
+- Kartu B: pilih lagu + output Bluetooth → PUTAR
+- Volume + loop (🔁) tiap slot. Config tersimpan otomatis.
+
+Dev:
 ```bash
 pip install -r pc/requirements.txt
-python pc/app_gui.py            # buka GUI
-python pc/app_gui.py --tray     # langsung jalan minim + sembunyi ke tray
+python pc/app_flet.py          # UI Flet (Material)
+python pc/test_dual_player.py  # test inti
 ```
 
-- GUI Material-ish gelap: pilih input/output, mode Mirror/Split, volume tiap output.
-- Tutup jendela saat jalan = sembunyi ke tray, audio tetap jalan.
-- Klik kanan ikon tray: Buka / Mulai / Stop / ganti mode / Keluar.
-- Config terakhir (device, mode, volume) tersimpan di `pc/config.json`, auto-jalan saat `--tray`.
-- Tanpa `pystray`: fallback minimize biasa. Pasang via requirements.
-- Tetap ada CLI: `python pc/audio_router.py --list`, `... --in-dev 1 --out-internal 2 --out-bt 3 --mode split`.
+## Android — APK (di Releases)
 
-Idle ≈ 0% CPU (event-driven). Jalan ≈ 1-3% (satu thread audio + queue 8 blok).
+Install APK di HP fisik, BT konek. Buka aplikasi:
 
-## Android (`android/`)
+- Slot A → internal, Slot B → Bluetooth (default otomatis)
+- 📂 Pilih lagu tiap slot (MP3/M4A/OGG, decode native) — kosong = nada uji
+- ▶ PUTAR BARENG. Jalan di foreground service, tutup aplikasi aman.
+- Tile Quick Settings "Dual Audio": tambah manual sekali, ketuk = start/stop.
 
-Buka `android/` di Android Studio, build ke HP fisik, BT konek.
-
-- UI Material3: kartu perangkat, toggle Mirror/Split, slider volume, tombol MULAI besar.
-- Suara jalan di `DualAudioService` (foreground + notifikasi + tombol Stop). Tutup aplikasi aman.
-- **Shortcut panel cepat**: tarik Quick Settings → edit tile → tambah "Dual Audio". Ketuk tile = start/stop tanpa buka aplikasi.
-- Mode ganti live tanpa putus suara. Perlu izin `BLUETOOTH_CONNECT` (Android 12+) + `POST_NOTIFICATIONS` (Android 13+), diminta otomatis.
+Dev: buka `android/` di Android Studio, `assembleDebug`.
 
 ## Batasan
 
-OS batasi rute audio sistem. Solusi ini kirim manual ke 2 output. Audio pihak ketiga (Spotify/YouTube) di Android butuh `AudioPlaybackCapture` (MediaProjection) — belum ada. Tambah bila perlu.
+OS batasi rute audio tingkat sistem — solusi ini kirim manual 2 stream. Audio aplikasi pihak ketiga (Spotify/YouTube) di Android butuh `AudioPlaybackCapture` — belum ada.
